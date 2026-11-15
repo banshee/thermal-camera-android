@@ -789,6 +789,8 @@ public class MainActivity extends AppCompatActivity implements ThermalCamera.Fra
                 });
                 Log.i(TAG, "Camera streaming started");
             } else {
+                thermalCamera.close();
+                currentDevice = null;
                 mainHandler.post(() -> {
                     isOpeningCamera = false;
                     updateStatus("Failed to start stream - tap to retry");
