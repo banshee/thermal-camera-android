@@ -15,11 +15,13 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Frame dimensions for Infiray P2 / Topdon TC001
+// Frame dimensions for Infiray P2 / Topdon TC001 (and 256x386 variants)
 static constexpr int FRAME_WIDTH = 256;
 static constexpr int FRAME_HEIGHT = 384;
 static constexpr int IMAGE_HEIGHT = 192;   // Top half: visual image
 static constexpr int THERMAL_HEIGHT = 192; // Bottom half: thermal data
+static int g_stream_height = FRAME_HEIGHT;
+static int g_thermal_row_offset = IMAGE_HEIGHT;
 
 // Global state
 static uvc_context_t *g_ctx = nullptr;
@@ -74,8 +76,8 @@ static void frameCallback(uvc_frame_t *frame, void *user_ptr) {
         return;
     }
 
-    // Expected: 256x384 YUYV = 256 * 384 * 2 bytes
-    size_t expected_size = FRAME_WIDTH * FRAME_HEIGHT * 2;
+    // Expected: at least 256x384 (or 256x386) YUYV = 256 * g_stream_height * 2 bytes
+    size_t expected_size = FRAME_WIDTH * g_stream_height * 2;
     if (frame->data_bytes < expected_size) {
         LOGE("Frame too small: %zu < %zu", frame->data_bytes, expected_size);
         return;
@@ -101,7 +103,7 @@ static void frameCallback(uvc_frame_t *frame, void *user_ptr) {
     float minTemp = 1000.0f, maxTemp = -1000.0f, sumTemp = 0.0f;
     int minRow = 0, minCol = 0, maxRow = 0, maxCol = 0;
 
-    uint8_t *thermal_data = data + (IMAGE_HEIGHT * stride);
+    uint8_t *thermal_data = data + (g_thermal_row_offset * stride);
 
     for (int y = 0; y < THERMAL_HEIGHT; y++) {
         for (int x = 0; x < FRAME_WIDTH; x++) {
@@ -392,26 +394,58 @@ Java_com_breyt_thermalcamera_ThermalCamera_nativeStartStream(
     // Reset frame counter
     g_frame_count = 0;
 
-    // Configure stream: 256x384 YUYV @ 25fps
+    // Log available UVC formats and frame sizes for diagnostics
+    const uvc_format_desc_t *fmt = uvc_get_format_descs(g_devh);
+    while (fmt != nullptr) {
+        LOGI("UVC format idx=%d subtype=%d fourcc='%.4s' bpp=%d",
+             fmt->bFormatIndex, fmt->bDescriptorSubtype,
+             reinterpret_cast<const char*>(fmt->fourccFormat), fmt->bBitsPerPixel);
+        const uvc_frame_desc_t *frm = fmt->frame_descs;
+        while (frm != nullptr) {
+            float defaultFps = frm->dwDefaultFrameInterval > 0
+                               ? 10000000.0f / frm->dwDefaultFrameInterval
+                               : 0.0f;
+            LOGI("  UVC frame idx=%d: %dx%d (default %.1f fps, maxBuf=%u)",
+                 frm->bFrameIndex, frm->wWidth, frm->wHeight, defaultFps,
+                 frm->dwMaxVideoFrameBufferSize);
+            frm = frm->next;
+        }
+        fmt = fmt->next;
+    }
+
+    // Configure stream: try 256x384 YUYV first (Infiray P2 / Topdon TC001),
+    // then 256x386 YUYV (Thermal Cam Co., Ltd / 2-row metadata variants).
     uvc_stream_ctrl_t ctrl;
-    uvc_error_t res = uvc_get_stream_ctrl_format_size(
-            g_devh, &ctrl,
-            UVC_FRAME_FORMAT_YUYV,
-            FRAME_WIDTH, FRAME_HEIGHT, 25);
+    uvc_error_t res = UVC_ERROR_INVALID_MODE;
+    const int candidateHeights[] = { FRAME_HEIGHT, 386 };
+    const int candidateFps[] = { 25, 0 };
+
+    for (int height : candidateHeights) {
+        for (int fps : candidateFps) {
+            res = uvc_get_stream_ctrl_format_size(
+                    g_devh, &ctrl,
+                    UVC_FRAME_FORMAT_YUYV,
+                    FRAME_WIDTH, height, fps);
+            if (res == UVC_SUCCESS) {
+                g_stream_height = height;
+                g_thermal_row_offset = (height == 386) ? (IMAGE_HEIGHT + 2) : IMAGE_HEIGHT;
+                LOGI("Negotiated YUYV %dx%d (fps=%d, thermalRowOffset=%d)",
+                     FRAME_WIDTH, height, fps, g_thermal_row_offset);
+                break;
+            }
+            LOGW("uvc_get_stream_ctrl_format_size(%dx%d, fps=%d) failed: %s",
+                 FRAME_WIDTH, height, fps, uvc_strerror(res));
+        }
+        if (res == UVC_SUCCESS) {
+            break;
+        }
+    }
 
     if (res < 0) {
-        LOGE("uvc_get_stream_ctrl_format_size failed: %s", uvc_strerror(res));
-        // Try without specific fps
-        res = uvc_get_stream_ctrl_format_size(
-                g_devh, &ctrl,
-                UVC_FRAME_FORMAT_YUYV,
-                FRAME_WIDTH, FRAME_HEIGHT, 0);
-        if (res < 0) {
-            LOGE("uvc_get_stream_ctrl_format_size (fps=0) failed: %s", uvc_strerror(res));
-            env->DeleteGlobalRef(g_callback_obj);
-            g_callback_obj = nullptr;
-            return JNI_FALSE;
-        }
+        LOGE("No supported YUYV stream mode found");
+        env->DeleteGlobalRef(g_callback_obj);
+        g_callback_obj = nullptr;
+        return JNI_FALSE;
     }
 
     LOGI("Stream ctrl: format=%d, frame=%d, interval=%u",

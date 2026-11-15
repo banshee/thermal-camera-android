@@ -8,4 +8,6 @@
     <usb-device vendor-id="3034" product-id="22593" />
     <!-- Generic Infiray thermal cameras -->
     <usb-device vendor-id="3034" />
+    <!-- Thermal Cam Co., Ltd (VID 0x3474, PID 0x4321) -->
+    <usb-device vendor-id="13428" product-id="17185" />
 </resources>
